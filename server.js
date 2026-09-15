@@ -1,7 +1,7 @@
 const http = require("http");
 const { readFile, writeFile, mkdir } = require("fs/promises");
 const path = require("path");
-const { computeSchedule, isValidDate, today } = require("./schedule");
+const { computeSchedule, findLimitViolations, isValidDate, today } = require("./schedule");
 
 const PORT = Number(process.env.PORT || 3020);
 let DB_FILE = process.env.DB_FILE || path.join(__dirname, "data", "db.json");
@@ -103,6 +103,14 @@ function normalizeDb(db) {
   db.batches.forEach((batch) => {
     if (typeof batch.urgency !== "number") batch.urgency = 3;
   });
+  // 登记序号:同级排序的稳定依据。老数据按数组顺序(即登记顺序)补发
+  if (!db.meta || typeof db.meta.seq !== "number") db.meta = { seq: 1 };
+  for (const collection of [db.batches, db.damages, db.workstations]) {
+    for (const item of collection) {
+      if (typeof item.seq !== "number") item.seq = db.meta.seq++;
+      else db.meta.seq = Math.max(db.meta.seq, item.seq + 1);
+    }
+  }
   return db;
 }
 
@@ -251,6 +259,18 @@ async function handlePlan(req, res, kind) {
     }
 
     const fixedDamageIds = new Set(fixedEntries.map((s) => s.damageId));
+
+    // 安全校验:不动项(锁定/已开工)在起始日及之后的当日工时不得冲破工位当前日上限。
+    // 例如日上限被调低后,已锁定记录占用超过新上限 → 明确冲突,且不落库任何超上限日计划。
+    const violations = findLimitViolations(db, fixedEntries, startDate);
+    if (violations.length) {
+      return send(res, 409, {
+        error: "已锁定或已开工的排期超过工位当前日工时上限,请调高上限或处理相关记录后再排期",
+        conflict: true,
+        violations
+      });
+    }
+
     const candidates = schedulableDamages(db, fixedDamageIds);
     const result = computeSchedule(db, { startDate, candidates, fixedEntries });
 
@@ -357,6 +377,7 @@ async function handle(req, res) {
     required(body, ["position", "type", "beforePhotoUrl"]);
     const damage = {
       id: makeId("damage"),
+      seq: db.meta.seq++,
       rubbingId,
       position: body.position,
       type: body.type,
@@ -420,6 +441,7 @@ async function handle(req, res) {
     if (!Number.isFinite(urgency)) return send(res, 400, { error: "urgency必须是数字,越小越紧迫" });
     const batch = {
       id: makeId("batch"),
+      seq: db.meta.seq++,
       name: body.name,
       status: "open",
       urgency,
@@ -493,6 +515,7 @@ async function handle(req, res) {
     }
     const workstation = {
       id: makeId("ws"),
+      seq: db.meta.seq++,
       name: body.name,
       dailyHours,
       disabledDates,
@@ -612,7 +635,7 @@ function setDbFile(file) {
 }
 async function resetDb(data) {
   await mkdir(path.dirname(DB_FILE), { recursive: true });
-  await writeDb(data ? normalizeDb(data) : freshInitialData());
+  await writeDb(normalizeDb(data || freshInitialData()));
 }
 
 if (require.main === module) {

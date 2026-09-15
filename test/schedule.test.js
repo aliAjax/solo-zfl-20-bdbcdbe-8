@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("fs/promises");
 const os = require("os");
 const path = require("path");
-const { createServer, setDbFile, resetDb } = require("../server");
+const { createServer, setDbFile, resetDb, freshInitialData } = require("../server");
 
 // 每个用例独立数据文件 + 独立服务实例,互不影响
 async function boot(t) {
@@ -318,4 +318,106 @@ test("未登记类型不丢项:进unscheduled并提示登记标准工时", async
   const replan = await api("POST", "/schedule/replan", { requestId: "req-unk-2", startDate: "2026-09-15" });
   assert.equal(replan.body.data.assignments.length, 1);
   assert.equal(replan.body.data.unscheduled.length, 0);
+});
+
+test("同毫秒登记:同级排序按登记序号稳定输出,重复排期结果一致", async (t) => {
+  const { api } = await boot(t);
+  // 直接造库:三个缺损项同一毫秒登记,id 字母序(a<m<z)与登记顺序(z,a,m)相反,
+  // 以此证明排序依据的是登记序号 seq 而非 id 或时间戳
+  const db = freshInitialData();
+  const sameMs = "2026-09-10T08:00:00.000Z";
+  db.workstations.push({ id: "ws_1", name: "甲位", dailyHours: 3, disabledDates: [], disabledWeekdays: [], createdAt: sameMs });
+  const mk = (id, seq) => ({
+    id, seq, rubbingId: "rubbing_demo", position: id, type: "撕裂",
+    beforePhotoUrl: "", afterPhotoUrl: "", status: "in_repair", repairNote: "",
+    batchId: "batch_x", createdAt: sameMs, repairedAt: null
+  });
+  db.damages.push(mk("damage_z", 1), mk("damage_a", 2), mk("damage_m", 3));
+  db.batches.push({
+    id: "batch_x", seq: 4, name: "同毫秒批", status: "open", urgency: 3,
+    damageIds: ["damage_z", "damage_a", "damage_m"], note: "", createdAt: sameMs, completedAt: null
+  });
+  db.meta = { seq: 5 };
+  await resetDb(db);
+
+  // 工位日上限 3h、每项 3h → 每天恰好一项,日期直接暴露排期顺序
+  const plan = await api("POST", "/schedule/plan", { requestId: "req-ms-1", startDate: "2026-09-15" });
+  assert.equal(plan.status, 200, JSON.stringify(plan.body));
+  assert.deepEqual(
+    plan.body.data.assignments.map((a) => a.damageId),
+    ["damage_z", "damage_a", "damage_m"],
+    "同毫秒登记也必须按登记序号先后输出"
+  );
+  const placementOf = (list) => Object.fromEntries(list.map((s) => [s.damageId, s.date]));
+  const expectDates = { damage_z: "2026-09-15", damage_a: "2026-09-16", damage_m: "2026-09-17" };
+  assert.deepEqual(placementOf(plan.body.data.assignments), expectDates);
+
+  // 同一请求号重复提交:返回首次结果,逐字节一致
+  const dup = await api("POST", "/schedule/plan", { requestId: "req-ms-1", startDate: "2026-09-15" });
+  assert.equal(dup.status, 200);
+  assert.equal(dup.body.data.duplicated, true);
+  assert.deepEqual(dup.body.data.assignments, plan.body.data.assignments);
+
+  // 反复重排(不同请求号):每次结果都完全相同,不随机
+  for (let i = 2; i <= 4; i++) {
+    const rp = await api("POST", "/schedule/replan", { requestId: `req-ms-${i}`, startDate: "2026-09-15" });
+    assert.equal(rp.status, 200, JSON.stringify(rp.body));
+    assert.deepEqual(rp.body.data.assignments.map((a) => a.damageId), ["damage_z", "damage_a", "damage_m"]);
+    assert.deepEqual(placementOf(rp.body.data.assignments), expectDates, `第${i}次重排放置必须一致`);
+  }
+});
+
+test("日上限调低后锁定项超限:返回409冲突且不落库,请求号不消耗,锁定项不挪动", async (t) => {
+  const { api } = await boot(t);
+  const ws = await addWorkstation(api, { dailyHours: 8 });
+  const d1 = await addDamage(api, "撕裂"); // 3h
+  const d2 = await addDamage(api, "撕裂"); // 3h
+  await openBatch(api, [d1.id, d2.id]);
+  const plan = await api("POST", "/schedule/plan", { requestId: "req-ov-0", startDate: "2026-09-15" });
+  assert.equal(plan.status, 200);
+  // 两项共 6h 都在 09-15(≤8h)
+  const e1 = (await scheduleOf(api, d1.id))[0];
+  const e2 = (await scheduleOf(api, d2.id))[0];
+  assert.equal(e1.date, "2026-09-15");
+  assert.equal(e2.date, "2026-09-15");
+  await api("PATCH", `/schedule/${e1.id}`, { locked: true });
+  await api("PATCH", `/schedule/${e2.id}`, { locked: true });
+
+  // 日上限 8h → 4h:锁定项合计 6h 已超新上限
+  await api("PATCH", `/workstations/${ws.id}`, { dailyHours: 4 });
+  const before = (await api("GET", "/schedule")).body.data;
+
+  const replan = await api("POST", "/schedule/replan", { requestId: "req-ov-1", startDate: "2026-09-15" });
+  assert.equal(replan.status, 409, JSON.stringify(replan.body));
+  assert.equal(replan.body.conflict, true);
+  assert.equal(replan.body.violations.length, 1);
+  const v = replan.body.violations[0];
+  assert.equal(v.workstationId, ws.id);
+  assert.equal(v.date, "2026-09-15");
+  assert.equal(v.usedHours, 6);
+  assert.equal(v.dailyHours, 4);
+  assert.deepEqual(v.entryIds.sort(), [e1.id, e2.id].sort());
+
+  // 不落库:排期与冲突前完全一致,没有留下超上限的日计划
+  const after = (await api("GET", "/schedule")).body.data;
+  assert.deepEqual(after, before);
+
+  // plan 同样拒绝:已有超上限的不动项时不允许再产出新计划
+  const planBlocked = await api("POST", "/schedule/plan", { requestId: "req-ov-2", startDate: "2026-09-15" });
+  assert.equal(planBlocked.status, 409);
+  assert.equal(planBlocked.body.conflict, true);
+
+  // 失败的请求不消耗请求号:补救后同一请求号可成功
+  await api("PATCH", `/workstations/${ws.id}`, { dailyHours: 8 });
+  const retry = await api("POST", "/schedule/replan", { requestId: "req-ov-1", startDate: "2026-09-15" });
+  assert.equal(retry.status, 200, JSON.stringify(retry.body));
+
+  // 锁定项本身从未被挪动
+  const final1 = (await scheduleOf(api, d1.id))[0];
+  const final2 = (await scheduleOf(api, d2.id))[0];
+  assert.equal(final1.id, e1.id);
+  assert.equal(final1.date, "2026-09-15");
+  assert.equal(final1.locked, true);
+  assert.equal(final2.id, e2.id);
+  assert.equal(final2.date, "2026-09-15");
 });

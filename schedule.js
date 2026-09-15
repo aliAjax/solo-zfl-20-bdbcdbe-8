@@ -36,7 +36,8 @@ function round4(n) {
   return Math.round(n * 10000) / 10000;
 }
 
-// 排序:批次紧迫度(数字小者优先) → 批次登记先后 → 缺损项登记先后 → 缺损项编号
+// 排序:批次紧迫度(数字小者优先) → 批次登记序号 → 缺损项登记序号。
+// seq 是持久化的自增登记序号,同毫秒登记也有稳定先后,重复排期结果一致。
 function sortCandidates(db, candidates) {
   const batchMap = new Map(db.batches.map((b) => [b.id, b]));
   const batchOf = (d) => batchMap.get(d.batchId) || {};
@@ -46,19 +47,52 @@ function sortCandidates(db, candidates) {
     const ua = ba.urgency ?? 3;
     const ub = bb.urgency ?? 3;
     if (ua !== ub) return ua - ub;
-    const baCreated = ba.createdAt || "";
-    const bbCreated = bb.createdAt || "";
-    if (baCreated !== bbCreated) return baCreated < bbCreated ? -1 : 1;
-    if ((a.createdAt || "") !== (b.createdAt || "")) return (a.createdAt || "") < (b.createdAt || "") ? -1 : 1;
-    if (a.id !== b.id) return a.id < b.id ? -1 : 1;
+    const batchSeq = (ba.seq ?? 0) - (bb.seq ?? 0);
+    if (batchSeq !== 0) return batchSeq;
+    const damageSeq = (a.seq ?? 0) - (b.seq ?? 0);
+    if (damageSeq !== 0) return damageSeq;
+    if (a.id !== b.id) return a.id < b.id ? -1 : 1; // 兜底,正常不会走到
     return 0;
   });
 }
 
-function byCreatedThenId(a, b) {
-  if ((a.createdAt || "") !== (b.createdAt || "")) return (a.createdAt || "") < (b.createdAt || "") ? -1 : 1;
+// 工位挑选顺序:按登记序号,同毫秒登记也稳定
+function bySeq(a, b) {
+  const d = (a.seq ?? 0) - (b.seq ?? 0);
+  if (d !== 0) return d;
   if (a.id !== b.id) return a.id < b.id ? -1 : 1;
   return 0;
+}
+
+// 校验不动项(锁定/已开工/已完成)在起始日及之后是否冲破工位当前日上限。
+// 返回违规列表:[{ workstationId, workstationName, date, usedHours, dailyHours, entryIds }]
+function findLimitViolations(db, entries, startDate) {
+  const wsMap = new Map(db.workstations.map((w) => [w.id, w]));
+  const usage = new Map(); // workstationId|date -> { used, entryIds }
+  for (const entry of entries) {
+    if (startDate && entry.date < startDate) continue; // 历史日计划不在本次排期范围
+    const key = `${entry.workstationId}|${entry.date}`;
+    if (!usage.has(key)) usage.set(key, { workstationId: entry.workstationId, date: entry.date, used: 0, entryIds: [] });
+    const u = usage.get(key);
+    u.used = round4(u.used + entry.hours);
+    u.entryIds.push(entry.id);
+  }
+  const violations = [];
+  for (const u of usage.values()) {
+    const ws = wsMap.get(u.workstationId);
+    if (!ws) continue;
+    if (u.used > ws.dailyHours + EPS) {
+      violations.push({
+        workstationId: u.workstationId,
+        workstationName: ws.name,
+        date: u.date,
+        usedHours: u.used,
+        dailyHours: ws.dailyHours,
+        entryIds: u.entryIds
+      });
+    }
+  }
+  return violations.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 }
 
 /**
@@ -72,7 +106,7 @@ function byCreatedThenId(a, b) {
  *   unscheduled: { damageId, reason }  排不下的项保留在此,不丢项
  */
 function computeSchedule(db, { startDate, candidates, fixedEntries }) {
-  const workstations = [...db.workstations].sort(byCreatedThenId);
+  const workstations = [...db.workstations].sort(bySeq);
   const typeHours = new Map(db.repairTypes.map((t) => [t.type, t.standardHours]));
 
   // 已固定记录占用的工时:workstationId|date -> 已用小时
@@ -165,5 +199,6 @@ module.exports = {
   weekdayOf,
   isDisabled,
   sortCandidates,
+  findLimitViolations,
   computeSchedule
 };
