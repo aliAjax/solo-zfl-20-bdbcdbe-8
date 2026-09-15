@@ -1,0 +1,10 @@
+{
+  "name": "rubbing-repair-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "古籍拓片缺损修补API:拓片/缺损项/批次管理 + 加工位排期",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  }
+}
